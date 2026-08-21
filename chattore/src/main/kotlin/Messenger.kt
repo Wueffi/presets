@@ -1,222 +1,214 @@
-package org.openredstone.chattore
+package org.openredstone.chattore.feature
 
-import com.velocitypowered.api.proxy.Player
+import com.velocitypowered.api.event.Subscribe
+import com.velocitypowered.api.event.proxy.ProxyShutdownEvent
 import com.velocitypowered.api.proxy.ProxyServer
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import net.kyori.adventure.text.Component
-import net.kyori.adventure.text.Component.space
-import net.kyori.adventure.text.TextReplacementConfig
-import net.kyori.adventure.text.event.ClickEvent
-import net.kyori.adventure.text.minimessage.tag.resolver.Placeholder
-import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
-import net.luckperms.api.LuckPerms
-import org.openredstone.chattore.feature.*
+import dev.kord.common.annotation.KordPreview
+import dev.kord.common.entity.Snowflake
+import dev.kord.core.Kord
+import dev.kord.core.entity.Message
+import dev.kord.core.entity.channel.TextChannel
+import dev.kord.core.event.message.MessageCreateEvent
+import dev.kord.core.live.channel.live
+import dev.kord.core.live.channel.onMessageCreate
+import dev.kord.gateway.Intent
+import dev.kord.gateway.Intents
+import dev.kord.gateway.PrivilegedIntent
+import kotlinx.coroutines.*
+import org.openredstone.chattore.*
 import org.slf4j.Logger
-import java.net.URI
-import java.util.*
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
-import kotlin.jvm.optionals.getOrNull
 
-fun PluginScope.createMessenger(
+fun String.discordEscape() = this.replace("""_""", "\\_")
+
+data class DiscordConfig(
+    val enable: Boolean = false,
+    val networkToken: String = "nouNetwork",
+    val channelId: Long = 1234L,
+    val chadId: Long = 1234L,
+    val playingMessage: String = "on the ORE Network",
+    val discordFormat: String = "`%prefix%` **%sender%**: %message%",
+    val serverTokens: Map<String, String> = mapOf(
+        "serverOne" to "token1",
+        "serverTwo" to "token2",
+        "serverThree" to "token3"
+    ),
+    val ingameFormat: String = "<dark_aqua>Discord</dark_aqua> <gray>|</gray> <dark_purple><sender></dark_purple><gray><reply>:</gray> <message>",
+)
+
+// TO Discord
+data class DiscordBroadcastEvent(
+    val prefix: String,
+    val sender: String,
+    val server: String,
+    val message: String,
+)
+
+// Comes under the "ORE Network" bot
+data class DiscordBroadcastEventMain(
+    val format: String,
+    val player: String,
+)
+
+fun PluginScope.createDiscordFeature(
+    messenger: Messenger,
     emojis: Emojis,
-    database: Storage,
-    luckPerms: LuckPerms,
-    formatConfig: FormatConfig,
-    wiretap: Wiretap,
-    userCache: UserCache,
-): Messenger {
-    val fileTypeMap = Json.parseToJsonElement(loadResourceAsString("filetypes.json"))
-        .jsonObject.mapValues { (_, value) -> value.jsonArray.map { it.jsonPrimitive.content } }
-        .onEach { (key, values) -> logger.info("Loaded ${values.size} of type $key") }
-    return Messenger(emojis, proxy, database, luckPerms, formatConfig, fileTypeMap, wiretap, logger, userCache)
+    config: DiscordConfig,
+) {
+    if (!config.enable) return
+
+    @OptIn(DelicateCoroutinesApi::class)
+    GlobalScope.launch(Dispatchers.Default) {
+        coroutineScope {
+            val discordNetwork = Kord(config.networkToken)
+            // login blocks until the bot shuts down, so we launch it in its own coroutine
+            launch {
+                discordNetwork.login {
+                    @OptIn(PrivilegedIntent::class)
+                    intents += Intent.MessageContent
+                    presence {
+                        playing(config.playingMessage)
+                    }
+                }
+            }
+            val discordMap = spawnServerBots(proxy, logger, config)
+            val serverChannels = discordMap.mapValues { (_, api) -> getGameChat(api, config.channelId) }
+            val mainBotChannel = getGameChat(discordNetwork, config.channelId)
+            val serverBotIds = discordMap.values.map { it.selfId }.toSet()
+            val listener = DiscordListener(logger, messenger, emojis, config, serverBotIds)
+            @OptIn(KordPreview::class)
+            mainBotChannel.live().onMessageCreate(block = listener::onMessageCreate)
+            registerListeners(DiscordBroadcastListener(config, serverChannels, mainBotChannel, this))
+            onEvent<ProxyShutdownEvent> {
+                // block so that velocity waits before shutting down
+                // future considerations:
+                // - can this use async velocity events?
+                // - should we do the shutdowns concurrently?
+                runBlocking {
+                    discordNetwork.shutdown()
+                    discordMap.forEach { (_, kord) -> kord.shutdown() }
+                }
+            }
+        }
+    }
 }
 
-class Messenger(
-    emojis: Emojis,
-    private val proxy: ProxyServer,
-    private val database: Storage,
-    private val luckPerms: LuckPerms,
-    private val formatConfig: FormatConfig,
-    private val fileTypeMap: Map<String, List<String>>,
-    private val wiretap: Wiretap,
-    private val logger: Logger,
-    private val userCache: UserCache,
+private suspend fun getGameChat(api: Kord, id: Long): TextChannel = api.getChannelOf(Snowflake(id))
+    ?: throw IllegalArgumentException("Cannot find game-chat channel")
+
+private class DiscordBroadcastListener(
+    private val config: DiscordConfig,
+    private val serverChannelMapping: Map<String, TextChannel>,
+    private val mainBotChannel: TextChannel,
+    private val scope: CoroutineScope,
 ) {
-    private val urlRegex = """<?((http|https)://([\w_-]+(?:\.[\w_-]+)+)([^\s'<>]+)?)>?""".toRegex()
-
-    private val chatReplacements = listOf(
-        formatReplacement("**", "b"),
-        formatReplacement("*", "i"),
-        formatReplacement("__", "u"),
-        formatReplacement("~~", "st"),
-        buildEmojiReplacement(emojis),
-    )
-    val excludedFromGlobalChat: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
-
-    private fun formatReplacement(key: String, tag: String): TextReplacementConfig =
-        TextReplacementConfig.builder()
-            .match("""((\\?)(${Regex.escape(key)}(.*?)${Regex.escape(key)}))""")
-            .replacement { result, _ ->
-                if (result.group(2).contains("\\") || result.group(4).endsWith("\\")) {
-                    result.group(3).toComponent()
-                } else {
-                    "<$tag>${result.group(4)}</$tag>".render()
-                }
-            }
-            .build()
-
-    private fun buildEmojiReplacement(emojis: Emojis): TextReplacementConfig =
-        TextReplacementConfig.builder()
-            .match(""":([A-Za-z0-9_\-+]+):""")
-            .replacement { result, _ ->
-                val match = result.group(1)
-                val content = emojis.nameToEmoji[match] ?: ":$match:"
-                "<hover:show_text:'$match'>$content</hover>".render()
-            }
-            .build()
-
-    private fun formatPrefix(player: Player): Component {
-        val luckUser = luckPerms.userManager.getUser(player.uniqueId)!! // online users guaranteed to be loaded
-        val prefix = luckUser.cachedData.metaData.prefix
-            ?: luckUser.primaryGroup.replaceFirstChar(Char::uppercaseChar)
-        return prefix.legacyDeserialize()
+    @Subscribe
+    fun onBroadcastEvent(event: DiscordBroadcastEvent) {
+        scope.launch {
+            val channel = serverChannelMapping[event.server] ?: return@launch
+            val content = config.discordFormat
+                .replace("%prefix%", event.prefix)
+                .replace("%sender%", event.sender.discordEscape())
+                .replace("%message%", event.message)
+            channel.createMessage(content)
+        }
     }
 
-    private fun formatSender(player: Player): Component {
-        val name = database.getNickname(player.uniqueId) ?: NickPreset(player.username)
-        return "<hover:show_text:'${player.username} | <i>Click for more</i>'><click:run_command:'/playerprofile info ${player.username}'><message></click></hover>"
-            .renderSimpleC(name.render(player.username))
+    @Subscribe
+    fun onBroadcastEventRaw(event: DiscordBroadcastEventMain) {
+        scope.launch {
+            val message = event.format
+                .replace("%player%", event.player.discordEscape())
+            mainBotChannel.createMessage(message)
+        }
+    }
+}
+
+private class DiscordListener(
+    private val logger: Logger,
+    private val messenger: Messenger,
+    private val emojis: Emojis,
+    private val config: DiscordConfig,
+    private val serverBotIds: Set<Snowflake>,
+) {
+    private val emojiPattern = emojis.emojiToName.keys.joinToString("|", "(", ")") { Regex.escape(it) }
+    private val emojiRegex = Regex(emojiPattern)
+    private val urlMarkdownRegex = """\[([^]]*)]\(\s?(\S+)\s?\)""".toRegex()
+    private val relayedMessageRegex = """^`.*?`\s*\*\*(.+?)\*\*:\s?(.*)$""".toRegex(RegexOption.DOT_MATCHES_ALL)
+
+    private fun replaceEmojis(input: String) = emojiRegex.replace(input) { matchResult ->
+        val emoji = matchResult.value
+        val emojiName = emojis.emojiToName[emoji]
+        if (emojiName != null) ":$emojiName:" else emoji
     }
 
-    fun formatReply(replyAuthor: String?, replyContent: String?): Component {
-        if (replyAuthor == null || replyContent == null) return "".render()
-        val originalMessage = replyContent.replace("'", "\\'")
-        return " <hover:show_text:'<aqua>$replyAuthor</aqua><gray>:</gray> $originalMessage'><gray>↪ $replyAuthor</gray></hover>"
-            .render()
+    private fun extractReplyInfo(referenced: Message): Pair<String, String>? {
+        val author = referenced.author
+        if (author != null && author.id in serverBotIds) {
+            val match = relayedMessageRegex.find(referenced.content) ?: return null
+            return match.groupValues[1] to match.groupValues[2]
+        }
+        return author?.username?.let { it to referenced.content }
     }
 
-    fun formatChatMessage(
-        message: String,
-        player: Player,
-        sender: Component = formatSender(player),
-        prefix: Component = formatPrefix(player),
-        messageID: Int? = null,
-        replyAuthor: String? = null,
-        replyContent: String? = null,
-        reply: Component = formatReply(replyAuthor, replyContent)
-    ) = formatConfig.chatMessage.render(
-        "message" toC prepareChatMessage(message, player, messageID),
-        "sender" toC sender,
-        "prefix" toC prefix,
-        "reply" toC reply,
-    )
+    fun onMessageCreate(event: MessageCreateEvent) {
+        // guaranteed to not happen because events are filtered beforehand
+        val sender = event.member ?: throw IllegalStateException("onMessageCreate: event.member is null")
+        if (sender.isBot && sender.id != Snowflake(config.chadId)) return
+        val attachments = event.message.attachments.joinToString(" ", " ") { it.url }
+        val toSend = replaceEmojis(event.message.content) + attachments
+        val displayName = sender.effectiveName
+        logger.info("[Discord] $displayName (${sender.id}): $toSend")
+        val transformedMessage = toSend.replace(urlMarkdownRegex) { matchResult ->
+            val text = matchResult.groupValues[1].trim()
+            val url = matchResult.groupValues[2].trim()
+            "$text: $url"
+        }.replace("""\s+""".toRegex(), " ")
 
-    val globalChat = proxy.all { it.uniqueId !in excludedFromGlobalChat }
+        val referenced = event.message.referencedMessage
+        val replyInfo = referenced?.let { extractReplyInfo(it) }
+        val replyAuthor = replyInfo?.first
+        val replyContent = replyInfo?.second?.let { replaceEmojis(it) }
 
-    fun broadcastChatMessage(
-        player: Player,
-        message: String,
-        replyAuthor: String? = null,
-        replyContent: String? = null
-    ) {
-        logger.info("${player.username} (${player.uniqueId}): $message")
-        val originServer = player.currentServer.getOrNull()?.serverInfo?.name ?: "VOID"
-        val compoPrefix = formatPrefix(player)
         val messageID = ChatReply.nextMessageId()
+        ChatReply.saveMessage(messageID, event.message.author?.username ?: "unknown", transformedMessage)
 
-        ChatReply.saveMessage(messageID, player.username, message)
-
-        globalChat.sendMessage(
-            formatChatMessage(
-                message,
-                player,
-                prefix = compoPrefix,
-                messageID = messageID,
-                replyAuthor = replyAuthor,
-                replyContent = replyContent
-            )
+        messenger.globalChat.sendRichMessage(
+            config.ingameFormat,
+            "sender" toS displayName,
+            "message" toC messenger.prepareChatMessage(transformedMessage, null, messageID),
+            "reply" toC messenger.formatReply(replyAuthor, replyContent),
         )
+    }
+}
 
-        val plainPrefix = PlainTextComponentSerializer.plainText().serialize(compoPrefix)
-        val discordBroadcast = DiscordBroadcastEvent(
-            plainPrefix,
-            player.username,
-            originServer,
-            message,
+private suspend fun CoroutineScope.spawnServerBots(
+    proxy: ProxyServer,
+    logger: Logger,
+    config: DiscordConfig,
+): Map<String, Kord> {
+    val serverTokens = config.serverTokens
+    val availableServers = proxy.allServers.map { it.serverInfo.name.lowercase() }.sorted()
+    val configServers = serverTokens.map { it.key.lowercase() }.sorted()
+    if (availableServers != configServers) {
+        logger.warn(
+            """
+                    Supplied server keys in Discord configuration section does not match available servers:
+                    Available servers: ${availableServers.joinToString()}
+                    Configured servers: ${configServers.joinToString()}
+                """.trimIndent()
         )
-        proxy.eventManager.fireAndForget(discordBroadcast)
     }
-
-    fun broadcastBubbleMessage(player: Player, message: String, bubble: Bubble) {
-        logger.info("[Bubble] ${player.username} (${player.uniqueId}): $message")
-        val formattedMessage = formatChatMessage(message, player)
-        val bubbleInfo = Placeholder.styling("bubble_info", bubble.formatInfo(userCache))
-        val renderedMessage =
-            Component.textOfChildren(formatConfig.bubblePrefix.render(bubbleInfo), space(), formattedMessage)
-        bubble.players.forEach { uuid ->
-            proxy.playerOrNull(uuid)?.sendMessage(renderedMessage)
-        }
-        wiretap(renderedMessage)
-    }
-
-    fun prepareChatMessage(
-        message: String,
-        player: Player?,
-        messageId: Int? = null,
-    ): Component {
-        val canObfuscate = player?.hasPermission("chattore.chat.obfuscate") ?: false
-        val parts = urlRegex.split(message)
-        val matches = urlRegex.findAll(message).iterator()
-        val builder = Component.text()
-        parts.forEach { part ->
-            builder.append(part.legacyDeserialize(canObfuscate))
-            if (matches.hasNext()) {
-                val nextMatch = matches.next()
-                builder.append(formatLink(nextMatch.groupValues[1]))
-            }
-        }
-        val content = builder.build().performReplacements(chatReplacements)
-        return if (messageId != null) {
-            content.clickEvent(ClickEvent.suggestCommand("/chatreply $messageId "))
-        } else {
-            content
-        }
-    }
-
-    private fun formatLink(str: String): Component {
-        val link = URI(str).toURL()
-        var type = "link"
-        var name = link.host
-        if (link.file.isNotEmpty()) {
-            val last = link.path.split("/").last()
-            if (last.contains('.') && !last.endsWith('.') && !last.startsWith('.')) {
-                type = last.split('.').last()
-                name = if (last.length > 15) {
-                    last.substring(0, 15) + "…." + type
-                } else {
-                    last
+    return serverTokens.mapValues { (_, token) ->
+        val kord = Kord(token)
+        launch {
+            kord.login {
+                // server bots don't need any intents
+                intents = Intents()
+                presence {
+                    playing(config.playingMessage)
                 }
             }
         }
-        val contentType = fileTypeMap.entries.find { type in it.value }?.key
-        val symbol = when (contentType) {
-            "IMAGE" -> "\uD83D\uDDBC"
-            "AUDIO" -> "\uD83D\uDD0A"
-            "VIDEO" -> "\uD83C\uDFA5"
-            "TEXT" -> "\uD83D\uDCDD"
-            else -> "\uD83D\uDCCE"
-        }
-        return ("<aqua><click:open_url:'$link'>" +
-            "<hover:show_text:'<aqua>$link'>" +
-            "[$symbol $name]" +
-            "</hover>" +
-            "</click><reset>").render()
+        kord
     }
-
-    private fun Component.performReplacements(replacements: List<TextReplacementConfig>): Component =
-        replacements.fold(this, Component::replaceText)
 }
